@@ -1,4 +1,7 @@
+import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { parseStrictInteger, parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 import {
@@ -468,6 +471,66 @@ export async function installLaunchAgent({
   return { plistPath };
 }
 
+function isCurrentProcessLikelyGatewayDescendant(gatewayPid: number | undefined): boolean {
+  if (gatewayPid === undefined) {
+    return false;
+  }
+  const ppid = process.ppid;
+  if (ppid === gatewayPid) {
+    return true;
+  }
+  if (process.pid === gatewayPid) {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Shell-escape a string for embedding in single-quoted shell arguments.
+ * Replaces every `'` with `'\''` (end quote, escaped quote, resume quote).
+ */
+function shellEscape(value: string): string {
+  return value.replace(/'/g, "'\\''");
+}
+
+/**
+ * Spawn a detached process to perform the LaunchAgent restart sequence.
+ * This is necessary when the current process might be killed as part of
+ * the restart (e.g., when called from an agent session via exec tool).
+ *
+ * The spawned process waits briefly, then performs bootout -> enable -> bootstrap -> kickstart.
+ * It runs independently of the parent process and self-cleans after completion.
+ */
+function spawnDetachedLaunchAgentRestart(domain: string, label: string, plistPath: string): void {
+  const escapedLabel = shellEscape(label);
+  const escapedPlistPath = shellEscape(plistPath);
+  const script = `#!/bin/sh
+# Detached LaunchAgent restart script
+# Wait briefly for parent to complete its response and exit.
+sleep 1
+# Perform bootout (may fail if already stopped, that's OK)
+launchctl bootout '${domain}/${escapedLabel}' 2>/dev/null || true
+# Clear any persisted disabled state
+launchctl enable '${domain}/${escapedLabel}' 2>/dev/null || true
+# Re-register from plist
+launchctl bootstrap '${domain}' '${escapedPlistPath}' 2>/dev/null || true
+# Start the service
+launchctl kickstart -k '${domain}/${escapedLabel}' 2>/dev/null || true
+# Self-cleanup
+rm -f "$0"
+`;
+  const tmpDir = os.tmpdir();
+  const scriptPath = path.join(tmpDir, `openclaw-restart-launchagent-${Date.now()}.sh`);
+
+  fsSync.writeFileSync(scriptPath, script, { mode: 0o755 });
+
+  const child = spawn("/bin/sh", [scriptPath], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
 export async function restartLaunchAgent({
   stdout,
   env,
@@ -482,6 +545,22 @@ export async function restartLaunchAgent({
     runtime.code === 0
       ? parseLaunchctlPrint(runtime.stdout || runtime.stderr || "").pid
       : undefined;
+
+  // Check if we need to use the detached restart approach.
+  // This is necessary when the current process might be killed as part of
+  // the gateway restart (e.g., when called from an agent session via exec tool).
+  // Issue: https://github.com/openclaw/openclaw/issues/41978
+  if (isCurrentProcessLikelyGatewayDescendant(previousPid)) {
+    spawnDetachedLaunchAgentRestart(domain, label, plistPath);
+    try {
+      stdout.write(`${formatLine("Restarting LaunchAgent (detached)", `${domain}/${label}`)}\n`);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EPIPE") {
+        throw err;
+      }
+    }
+    return;
+  }
 
   const stop = await execLaunchctl(["bootout", `${domain}/${label}`]);
   if (stop.code !== 0 && !isLaunchctlNotLoaded(stop)) {
