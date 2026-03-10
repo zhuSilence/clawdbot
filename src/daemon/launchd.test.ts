@@ -22,6 +22,9 @@ const state = vi.hoisted(() => ({
   dirModes: new Map<string, number>(),
   files: new Map<string, string>(),
   fileModes: new Map<string, number>(),
+  spawnCalls: [] as Array<{ file: string; args: string[]; options: object }>,
+  spawnUnrefCalled: false,
+  writeFileSyncCalls: [] as Array<{ path: string; content: string; options: object }>,
 }));
 const defaultProgramArguments = ["node", "-e", "process.exit(0)"];
 
@@ -104,6 +107,29 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return { ...wrapped, default: wrapped };
 });
 
+vi.mock("node:child_process", () => ({
+  spawn: vi.fn((file: string, args: string[], options: object) => {
+    state.spawnCalls.push({ file, args, options });
+    return {
+      unref: () => {
+        state.spawnUnrefCalled = true;
+      },
+    };
+  }),
+}));
+
+vi.mock("node:fs", () => {
+  const writeFileSync = vi.fn((p: string, content: string, options: object) => {
+    state.writeFileSyncCalls.push({ path: p, content, options });
+  });
+  return { default: { writeFileSync }, writeFileSync };
+});
+
+vi.mock("node:os", () => ({
+  default: { tmpdir: () => "/tmp" },
+  tmpdir: () => "/tmp",
+}));
+
 beforeEach(() => {
   state.launchctlCalls.length = 0;
   state.listOutput = "";
@@ -113,6 +139,9 @@ beforeEach(() => {
   state.dirModes.clear();
   state.files.clear();
   state.fileModes.clear();
+  state.spawnCalls.length = 0;
+  state.spawnUnrefCalled = false;
+  state.writeFileSyncCalls.length = 0;
   vi.clearAllMocks();
 });
 
@@ -445,5 +474,90 @@ describe("resolveLaunchAgentPlistPath", () => {
     },
   ])("$name", ({ env, expected }) => {
     expect(resolveLaunchAgentPlistPath(env)).toBe(expected);
+  });
+});
+
+describe("restartLaunchAgent detached process handling", () => {
+  function createDefaultLaunchdEnv(): Record<string, string | undefined> {
+    return {
+      HOME: "/Users/test",
+      OPENCLAW_PROFILE: "default",
+    };
+  }
+
+  it("uses detached restart when parent process is the gateway", async () => {
+    const env = createDefaultLaunchdEnv();
+    const gatewayPid = 99999;
+    const originalPpid = process.ppid;
+
+    state.printOutput = ["state = running", `pid = ${gatewayPid}`].join("\n");
+
+    Object.defineProperty(process, "ppid", {
+      value: gatewayPid,
+      writable: true,
+      configurable: true,
+    });
+
+    try {
+      await restartLaunchAgent({
+        env,
+        stdout: new PassThrough(),
+      });
+
+      expect(state.writeFileSyncCalls.length).toBe(1);
+      const scriptContent = state.writeFileSyncCalls[0].content;
+      expect(scriptContent).toContain("launchctl bootout");
+      expect(scriptContent).toContain("launchctl bootstrap");
+      expect(scriptContent).toContain("launchctl kickstart");
+
+      expect(state.spawnCalls.length).toBe(1);
+      const spawnCall = state.spawnCalls[0];
+      expect(spawnCall.file).toBe("/bin/sh");
+      expect(spawnCall.args[0]).toMatch(/openclaw-restart-launchagent/);
+      expect(spawnCall.options).toMatchObject({ detached: true, stdio: "ignore" });
+      expect(state.spawnUnrefCalled).toBe(true);
+
+      expect(state.launchctlCalls.some((c) => c[0] === "bootout")).toBe(false);
+      expect(state.launchctlCalls.some((c) => c[0] === "bootstrap")).toBe(false);
+    } finally {
+      Object.defineProperty(process, "ppid", {
+        value: originalPpid,
+        writable: true,
+        configurable: true,
+      });
+    }
+  });
+
+  it("uses normal restart when parent process is not the gateway", async () => {
+    const env = createDefaultLaunchdEnv();
+    const gatewayPid = 99999;
+
+    state.printOutput = ["state = running", `pid = ${gatewayPid}`].join("\n");
+
+    await restartLaunchAgent({
+      env,
+      stdout: new PassThrough(),
+    });
+
+    expect(state.launchctlCalls.some((c) => c[0] === "bootout")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "enable")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "bootstrap")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "kickstart")).toBe(true);
+  });
+
+  it("uses normal restart when gateway pid is undefined", async () => {
+    const env = createDefaultLaunchdEnv();
+
+    state.printOutput = "state = stopped";
+
+    await restartLaunchAgent({
+      env,
+      stdout: new PassThrough(),
+    });
+
+    expect(state.launchctlCalls.some((c) => c[0] === "bootout")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "enable")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "bootstrap")).toBe(true);
+    expect(state.launchctlCalls.some((c) => c[0] === "kickstart")).toBe(true);
   });
 });
